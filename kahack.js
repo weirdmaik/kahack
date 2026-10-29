@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         KaHack
-// @version      23.6.1
-// @description  Kahoot answer + puzzle helper
+// @version      23.9.0
+// @description  Kahoot answer + puzzle helper with live player list and feed
 // @match        https://kahoot.it/*
 // @match        https://kahoot.it/challenge/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=kahoot.it
@@ -13,6 +13,7 @@
 
     const STORAGE_KEY = 'kahack_last_input';
     const PLAYERS_POS_KEY = 'kahack_players_pos';
+    const FEED_ENABLED_KEY = 'kahack_feed_enabled';
 
     let questions = [];
     let loaded = false;
@@ -54,17 +55,19 @@
     };
 
     const getMyUsername = () => {
+        // Try specific data selectors first
         let el = document.querySelector('[data-functional-selector*="nickname"]');
         if (el && el.textContent.trim()) return el.textContent.trim();
 
         el = document.querySelector('[data-functional-selector*="username"]');
         if (el && el.textContent.trim()) return el.textContent.trim();
 
+        // Fallback to scanning for a short text near the bottom left (Kahoot's "you" indicator)
         const candidates = document.querySelectorAll('div, span');
         for (const c of candidates) {
             const r = c.getBoundingClientRect();
             const txt = c.textContent.trim();
-            if (r.left < 150 && r.bottom > window.innerHeight - 120 &&
+            if (r.left < 200 && r.bottom > window.innerHeight - 150 &&
                 txt.length > 0 && txt.length < 20 && c.children.length === 0) {
                 const lower = txt.toLowerCase();
                 if (lower === 'react' || lower === 'kahack' ||
@@ -100,11 +103,9 @@
     function saveLastInput(raw) {
         try { localStorage.setItem(STORAGE_KEY, raw); } catch(e) {}
     }
-
     function getLastInput() {
         try { return localStorage.getItem(STORAGE_KEY) || ''; } catch(e) { return ''; }
     }
-
     function getPlayersPos() {
         try {
             const raw = localStorage.getItem(PLAYERS_POS_KEY);
@@ -114,9 +115,14 @@
         } catch(e) {}
         return null;
     }
-
     function savePlayersPos(x, y) {
         try { localStorage.setItem(PLAYERS_POS_KEY, JSON.stringify({ x, y })); } catch(e) {}
+    }
+    function getFeedEnabled() {
+        try { return localStorage.getItem(FEED_ENABLED_KEY) !== '0'; } catch(e) { return true; }
+    }
+    function setFeedEnabled(v) {
+        try { localStorage.setItem(FEED_ENABLED_KEY, v ? '1' : '0'); } catch(e) {}
     }
 
     // ---------- SHOW ANSWERS ----------
@@ -275,8 +281,9 @@
     }
 
     // ============================================================
-    // PLAYERS LIST — dedicated drag system (isolated)
+    // PLAYERS LIST & FEED (Robust, Live, Global Observer)
     // ============================================================
+
     const UI_NOISE = new Set([
         'quiz', 'correct', 'test', 'react', 'label', 'consent', 'leg.interest',
         'show answers', 'fetch', 'kahack', 'press h', 'ready', 'start',
@@ -292,26 +299,193 @@
         return false;
     }
 
-    let playersDragAbort = null; // AbortController for the players panel's listeners
+    let playersDragAbort = null;
+    let playersObserver = null;
+    let playersRefreshTimer = null;
+    
+    // Track the last known state to detect joins/leaves
+    let lastKnownPlayers = new Set();
+    let feedEnabled = getFeedEnabled();
+
+    // Scan the whole DOM for names. This is more reliable than guessing the exact container.
+    function collectPlayerNames() {
+        const me = getMyUsername();
+        const names = new Set();
+        
+        // Kahoot's lobby usually uses these patterns for player rows
+        const selectors = [
+            '[data-functional-selector*="lobby-player"]',
+            '[data-functional-selector*="player-name"]',
+            '[data-functional-selector*="lobby-nickname"]',
+            // Fallback: look for generic list items or divs inside a lobby view
+            '[class*="player-row"]',
+            '[class*="PlayerRow"]'
+        ];
+        
+        selectors.forEach(sel => {
+            document.querySelectorAll(sel).forEach(el => {
+                const txt = el.textContent.trim();
+                if (txt && !isUiNoise(txt)) {
+                    // Ignore very long strings that are likely UI text
+                    if (txt.length < 25) names.add(txt);
+                }
+            });
+        });
+
+        // Remove 'me' from the general list if it somehow got in there
+        if (me) names.delete(me);
+        
+        return { me, names: Array.from(names) };
+    }
+
+    function updatePlayersHeader() {
+        const hdr = document.getElementById('kh-players-hdr');
+        if (!hdr) return;
+        const { me, names } = collectPlayerNames();
+        const total = names.length + (me ? 1 : 0);
+        hdr.textContent = 'Players (' + total + ')';
+    }
+
+    function refreshPlayers() {
+        const list = document.getElementById('kh-players-list');
+        if (!list) return;
+        
+        const { me, names } = collectPlayerNames();
+        
+        // Rebuild the list
+        list.innerHTML = '';
+        
+        // 1. Pinned Self
+        if (me) {
+            const row = document.createElement('div');
+            row.style.cssText = 'padding: 4px 0; border-bottom: 1px solid #1a1a1a; color: #00cc66; font-weight: 600;';
+            row.textContent = me + ' (you)';
+            list.appendChild(row);
+        }
+
+        // 2. Others
+        if (names.length > 0) {
+            names.forEach(name => {
+                const row = document.createElement('div');
+                row.style.cssText = 'padding: 4px 0; border-bottom: 1px solid #1a1a1a;';
+                row.textContent = name;
+                list.appendChild(row);
+            });
+        } else {
+            const empty = document.createElement('div');
+            empty.style.cssText = 'opacity:0.5; font-style:italic;';
+            empty.textContent = 'No other players.';
+            list.appendChild(empty);
+        }
+
+        updatePlayersHeader();
+    }
+
+    // ---- Feed / Toast System ----
+    function ensureFeedContainer() {
+        let el = document.getElementById('kh-feed');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'kh-feed';
+            el.style.cssText = `
+                position: fixed; right: 20px; bottom: 20px; width: 220px;
+                display: flex; flex-direction: column; gap: 6px;
+                z-index: 999999; pointer-events: none;
+            `;
+            document.body.appendChild(el);
+        }
+        return el;
+    }
+
+    function pushFeed(kind, name) {
+        if (!feedEnabled) return;
+        const feed = ensureFeedContainer();
+        const item = document.createElement('div');
+        const isJoin = kind === 'join';
+        
+        item.style.cssText = `
+            background: #0a0a0a;
+            border-left: 3px solid ${isJoin ? '#00cc66' : '#cc2244'};
+            border-radius: 4px; padding: 6px 10px; color: #ccc;
+            font-family: 'Segoe UI', sans-serif; font-size: 11px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.7);
+            opacity: 0; transform: translateX(20px);
+            transition: opacity 0.2s ease, transform 0.2s ease;
+        `;
+        item.textContent = (isJoin ? '+ ' : '- ') + name + (isJoin ? ' joined' : ' left');
+        
+        feed.appendChild(item);
+        requestAnimationFrame(() => {
+            item.style.opacity = '1';
+            item.style.transform = 'translateX(0)';
+        });
+        setTimeout(() => {
+            item.style.opacity = '0';
+            item.style.transform = 'translateX(20px)';
+            setTimeout(() => item.remove(), 220);
+        }, 2800);
+
+        while (feed.children.length > 6) {
+            feed.firstChild.remove();
+        }
+    }
+
+    function computeFeedChanges() {
+        const { me, names } = collectPlayerNames();
+        const current = new Set(names);
+        if (me) current.add(me);
+
+        // Skip the very first run to establish a baseline
+        if (lastKnownPlayers.size === 0) {
+            lastKnownPlayers = current;
+            return;
+        }
+
+        current.forEach(name => {
+            if (!lastKnownPlayers.has(name)) pushFeed('join', name);
+        });
+        lastKnownPlayers.forEach(name => {
+            if (!current.has(name)) pushFeed('leave', name);
+        });
+
+        lastKnownPlayers = current;
+    }
+
+    function startPlayerWatcher() {
+        if (playersObserver) return;
+        
+        // Observe the entire body. It's a bit heavier, but guarantees we catch Kahoot's dynamic React updates.
+        playersObserver = new MutationObserver(() => {
+            // Debounce: wait 150ms before actually doing the DOM diffing and rendering
+            if (playersRefreshTimer) return;
+            playersRefreshTimer = setTimeout(() => {
+                playersRefreshTimer = null;
+                refreshPlayers();
+                computeFeedChanges();
+            }, 150);
+        });
+
+        playersObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            characterData: true
+        });
+    }
+
+    function stopPlayerWatcher() {
+        if (playersObserver) {
+            playersObserver.disconnect();
+            playersObserver = null;
+        }
+        if (playersRefreshTimer) {
+            clearTimeout(playersRefreshTimer);
+            playersRefreshTimer = null;
+        }
+    }
 
     function showPlayers() {
         if (document.getElementById('kh-players')) return;
 
-        // Build player list
-        const me = getMyUsername();
-        let names = [];
-        document.querySelectorAll(
-            '[data-functional-selector*="lobby-player"], ' +
-            '[data-functional-selector*="player-name"], ' +
-            '[data-functional-selector*="lobby-nickname"]'
-        ).forEach(el => {
-            const txt = el.textContent.trim();
-            if (txt && !isUiNoise(txt) && !names.includes(txt)) {
-                names.push(txt);
-            }
-        });
-
-        // ---- Panel element ----
         const panel = document.createElement('div');
         panel.id = 'kh-players';
 
@@ -322,70 +496,52 @@
             left: ${saved ? saved.x + 'px' : '50%'};
             top: ${saved ? saved.y + 'px' : '50%'};
             ${useTransform ? 'transform: translate(-50%, -50%);' : ''}
-            background: #0a0a0a;
-            border: 1px solid #2a2a2a;
-            border-radius: 8px;
-            color: #ccc;
-            font-family: 'Segoe UI', sans-serif;
-            font-size: 12px;
-            z-index: 999999;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.9);
-            padding: 12px;
-            min-width: 180px;
-            max-width: 360px;
-            max-height: 70vh;
-            overflow-y: auto;
-            opacity: 0;
+            background: #0a0a0a; border: 1px solid #2a2a2a;
+            border-radius: 8px; color: #ccc;
+            font-family: 'Segoe UI', sans-serif; font-size: 12px;
+            z-index: 999999; box-shadow: 0 8px 32px rgba(0,0,0,0.9);
+            padding: 12px; min-width: 180px; max-width: 360px; max-height: 70vh;
+            overflow-y: auto; opacity: 0;
             transition: opacity 0.15s ease, transform 0.15s ease;
         `;
 
-        const totalCount = names.length + (me && !names.includes(me) ? 1 : 0);
-
-        // ---- Header (drag handle) ----
         const header = document.createElement('div');
         header.id = 'kh-players-hdr';
         header.style.cssText = 'font-weight:700; font-size:13px; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid #2a2a2a; cursor: move; user-select: none;';
-        header.textContent = 'Players (' + totalCount + ')';
+        header.textContent = 'Players (0)';
         panel.appendChild(header);
 
-        // ---- Me ----
-        if (me) {
-            const row = document.createElement('div');
-            row.style.cssText = 'padding: 4px 0; border-bottom: 1px solid #1a1a1a; color: #00cc66; font-weight: 600;';
-            row.textContent = me + ' (you)';
-            panel.appendChild(row);
-        }
+        const list = document.createElement('div');
+        list.id = 'kh-players-list';
+        panel.appendChild(list);
 
-        // ---- Others ----
-        if (names.length > 0) {
-            names.forEach(name => {
-                if (name === me) return;
-                const row = document.createElement('div');
-                row.style.cssText = 'padding: 4px 0; border-bottom: 1px solid #1a1a1a;';
-                row.textContent = name;
-                panel.appendChild(row);
-            });
-        } else if (!me) {
-            const empty = document.createElement('div');
-            empty.style.cssText = 'opacity:0.5; font-style:italic;';
-            empty.textContent = 'No players found in lobby.';
-            panel.appendChild(empty);
-        }
+        const feedToggle = document.createElement('div');
+        feedToggle.id = 'kh-feed-toggle';
+        feedToggle.style.cssText = 'font-size:9px; opacity:0.6; margin-top:8px; text-align:center; cursor:pointer; user-select:none;';
+        feedToggle.textContent = 'feed: ' + (feedEnabled ? 'on (J)' : 'off (J)');
+        feedToggle.onclick = () => {
+            feedEnabled = !feedEnabled;
+            setFeedEnabled(feedEnabled);
+            feedToggle.textContent = 'feed: ' + (feedEnabled ? 'on (J)' : 'off (J)');
+        };
+        panel.appendChild(feedToggle);
 
-        // ---- Footer hint ----
         const hint = document.createElement('div');
-        hint.style.cssText = 'font-size:9px; opacity:0.4; margin-top:8px; text-align:center;';
+        hint.style.cssText = 'font-size:9px; opacity:0.4; margin-top:6px; text-align:center;';
         hint.textContent = 'press P to close';
         panel.appendChild(hint);
 
         document.body.appendChild(panel);
 
-        // ---- Trigger fade-in ----
+        // Initial fill and watch start
+        refreshPlayers();
+        lastKnownPlayers = new Set(); // Reset to avoid fake joins
+        computeFeedChanges();
+        startPlayerWatcher();
+
         requestAnimationFrame(() => { panel.style.opacity = '1'; });
 
-        // ============================================================
-        // DRAG SYSTEM (isolated, uses AbortController for cleanup)
-        // ============================================================
+        // Dragging logic
         playersDragAbort = new AbortController();
         const signal = playersDragAbort.signal;
 
@@ -395,7 +551,6 @@
 
         header.addEventListener('mousedown', e => {
             e.preventDefault();
-            // If panel is still centered via transform, lock in absolute coords
             const r = panel.getBoundingClientRect();
             if (panel.style.transform && panel.style.transform !== 'none') {
                 panel.style.transform = 'none';
@@ -426,13 +581,15 @@
     function hidePlayers() {
         const panel = document.getElementById('kh-players');
         if (!panel) return;
-        // Fade out
-        panel.style.opacity = '0';
-        // Clean up drag listeners immediately
+
+        stopPlayerWatcher();
+
         if (playersDragAbort) {
             playersDragAbort.abort();
             playersDragAbort = null;
         }
+
+        panel.style.opacity = '0';
         setTimeout(() => {
             if (panel.parentElement) panel.remove();
         }, 150);
@@ -446,7 +603,7 @@
         }
     }
 
-    // ---------- UI (Kahack window — UNCHANGED) ----------
+    // ---------- MAIN UI ----------
     let ui = null;
 
     function buildUI() {
@@ -459,8 +616,7 @@
                 border-radius: 8px; color: #ccc;
                 font-family: 'Segoe UI', sans-serif; font-size: 12px;
                 z-index: 99999; box-shadow: 0 8px 32px rgba(0,0,0,0.8);
-                overflow: hidden;
-                transition: opacity 0.15s, transform 0.15s;
+                overflow: hidden; transition: opacity 0.15s, transform 0.15s;
             }
             #kh.hidden { opacity: 0; transform: scale(0.95); pointer-events: none; }
             #kh .hdr {
@@ -489,41 +645,25 @@
             #kh button:hover { background: #1f1f1f; }
             #kh button.reveal {
                 background: #00cc66; color: #000;
-                border: none; width: 100%;
-                padding: 10px; font-size: 12px;
-                font-weight: 700; letter-spacing: 0.5px;
+                border: none; width: 100%; padding: 10px;
+                font-size: 12px; font-weight: 700; letter-spacing: 0.5px;
                 margin-top: 2px;
             }
             #kh button.reveal:hover { opacity: 0.85; }
-            #kh button.reveal:active {
-                transform: scale(0.98);
-                background: #00aa55;
-            }
+            #kh button.reveal:active { transform: scale(0.98); background: #00aa55; }
             #kh .status {
-                font-size: 10px; text-align: center;
-                opacity: 0.6; min-height: 14px;
-                transition: opacity 0.3s;
+                font-size: 10px; text-align: center; opacity: 0.6;
+                min-height: 14px; transition: opacity 0.3s;
             }
             #kh .puzzle-info {
-                display: none;
-                background: #141414;
-                border: 1px solid #2a2a2a;
-                border-radius: 4px;
-                padding: 6px 8px;
-                font-size: 11px;
-                color: #00cc66;
-                margin-top: 4px;
+                display: none; background: #141414;
+                border: 1px solid #2a2a2a; border-radius: 4px;
+                padding: 6px 8px; font-size: 11px; color: #00cc66; margin-top: 4px;
             }
             #kh .puzzle-info.on { display: block; }
-            #kh .puzzle-info ol {
-                margin: 4px 0 0 0; padding-left: 18px;
-                color: #ccc; font-size: 11px;
-            }
-            #kh .info {
-                display: flex; justify-content: space-between;
-                font-size: 11px; opacity: 0.7;
-                align-items: center;
-            }
+            #kh .puzzle-info ol { margin: 4px 0 0 0; padding-left: 18px; color: #ccc; font-size: 11px; }
+            #kh .info { display: flex; justify-content: space-between; font-size: 11px; opacity: 0.7; align-items: center; }
+            #kh .keys { font-size: 9px; opacity: 0.5; display: flex; justify-content: space-between; gap: 6px; margin-top: 4px; }
         `;
         document.head.appendChild(style);
 
@@ -548,6 +688,11 @@
                 <div class="info">
                     <span id="kh-q">0/0</span>
                 </div>
+                <div class="keys">
+                    <span>R answers</span>
+                    <span>P players</span>
+                    <span>J feed</span>
+                </div>
             </div>
         `;
         document.body.appendChild(ui);
@@ -569,7 +714,6 @@
             }
         });
 
-        // Kahack window drag — UNCHANGED
         let drag = false, ox, oy;
         document.getElementById('kh-hdr').addEventListener('mousedown', e => {
             drag = true;
@@ -582,10 +726,7 @@
             ui.style.left = Math.max(0, Math.min(window.innerWidth - ui.offsetWidth, e.clientX - ox)) + 'px';
             ui.style.top = Math.max(0, Math.min(window.innerHeight - ui.offsetHeight, e.clientY - oy)) + 'px';
         });
-        document.addEventListener('mouseup', () => {
-            if (!drag) return;
-            drag = false;
-        });
+        document.addEventListener('mouseup', () => { if (!drag) return; drag = false; });
     }
 
     // ---------- MONITOR ----------
@@ -606,25 +747,28 @@
 
     // ---------- KEYBIND ----------
     document.addEventListener('keydown', e => {
-        if (e.key.toLowerCase() === 'h' && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            const tag = document.activeElement?.tagName;
-            if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        const tag = document.activeElement?.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+        const key = e.key.toLowerCase();
+
+        if (key === 'h') {
             e.preventDefault();
             if (ui) ui.classList.toggle('hidden');
-            return;
-        }
-        if (e.key.toLowerCase() === 'r' && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            const tag = document.activeElement?.tagName;
-            if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        } else if (key === 'r') {
             e.preventDefault();
             if (loaded) flashAnswers();
-            return;
-        }
-        if (e.key.toLowerCase() === 'p' && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            const tag = document.activeElement?.tagName;
-            if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        } else if (key === 'p') {
             e.preventDefault();
             togglePlayers();
+        } else if (key === 'j') {
+            e.preventDefault();
+            feedEnabled = !feedEnabled;
+            setFeedEnabled(feedEnabled);
+            const tgl = document.getElementById('kh-feed-toggle');
+            if (tgl) tgl.textContent = 'feed: ' + (feedEnabled ? 'on (J)' : 'off (J)');
+            showStatus('feed ' + (feedEnabled ? 'on' : 'off'), 1500);
         }
     });
 
@@ -647,7 +791,7 @@
             }, 1000);
         }
 
-        console.log('[KaHack] v23.6.1 ready — P for players');
+        console.log('[KaHack] v23.9.0 ready — H ui, R answers, P players, J feed');
     }
 
     init();
