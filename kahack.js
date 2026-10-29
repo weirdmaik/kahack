@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         KaHack
-// @version      23.1.0
+// @version      23.6.1
 // @description  Kahoot answer + puzzle helper
 // @match        https://kahoot.it/*
 // @match        https://kahoot.it/challenge/*
@@ -12,6 +12,7 @@
     'use strict';
 
     const STORAGE_KEY = 'kahack_last_input';
+    const PLAYERS_POS_KEY = 'kahack_players_pos';
 
     let questions = [];
     let loaded = false;
@@ -52,6 +53,28 @@
         return m ? parseInt(m[1]) : questions.length;
     };
 
+    const getMyUsername = () => {
+        let el = document.querySelector('[data-functional-selector*="nickname"]');
+        if (el && el.textContent.trim()) return el.textContent.trim();
+
+        el = document.querySelector('[data-functional-selector*="username"]');
+        if (el && el.textContent.trim()) return el.textContent.trim();
+
+        const candidates = document.querySelectorAll('div, span');
+        for (const c of candidates) {
+            const r = c.getBoundingClientRect();
+            const txt = c.textContent.trim();
+            if (r.left < 150 && r.bottom > window.innerHeight - 120 &&
+                txt.length > 0 && txt.length < 20 && c.children.length === 0) {
+                const lower = txt.toLowerCase();
+                if (lower === 'react' || lower === 'kahack' ||
+                    /^\d+$/.test(txt) || txt.includes('@')) continue;
+                return txt;
+            }
+        }
+        return null;
+    };
+
     // ---------- STATUS ----------
     function showStatus(text, duration = 2500) {
         const el = document.getElementById('kh-status');
@@ -80,6 +103,20 @@
 
     function getLastInput() {
         try { return localStorage.getItem(STORAGE_KEY) || ''; } catch(e) { return ''; }
+    }
+
+    function getPlayersPos() {
+        try {
+            const raw = localStorage.getItem(PLAYERS_POS_KEY);
+            if (!raw) return null;
+            const p = JSON.parse(raw);
+            if (typeof p.x === 'number' && typeof p.y === 'number') return p;
+        } catch(e) {}
+        return null;
+    }
+
+    function savePlayersPos(x, y) {
+        try { localStorage.setItem(PLAYERS_POS_KEY, JSON.stringify({ x, y })); } catch(e) {}
     }
 
     // ---------- SHOW ANSWERS ----------
@@ -237,9 +274,180 @@
             .catch(() => showStatus('fetch failed', 3000));
     }
 
-    // ---------- UI ----------
+    // ============================================================
+    // PLAYERS LIST — dedicated drag system (isolated)
+    // ============================================================
+    const UI_NOISE = new Set([
+        'quiz', 'correct', 'test', 'react', 'label', 'consent', 'leg.interest',
+        'show answers', 'fetch', 'kahack', 'press h', 'ready', 'start',
+        'players', 'lobby', 'join', 'game pin', 'nickname', 'enter'
+    ]);
+
+    function isUiNoise(text) {
+        const lower = text.toLowerCase();
+        if (UI_NOISE.has(lower)) return true;
+        if (/^\d+\/\d+$/.test(text)) return true;
+        if (/^\d+$/.test(text)) return true;
+        if (text.length > 20) return true;
+        return false;
+    }
+
+    let playersDragAbort = null; // AbortController for the players panel's listeners
+
+    function showPlayers() {
+        if (document.getElementById('kh-players')) return;
+
+        // Build player list
+        const me = getMyUsername();
+        let names = [];
+        document.querySelectorAll(
+            '[data-functional-selector*="lobby-player"], ' +
+            '[data-functional-selector*="player-name"], ' +
+            '[data-functional-selector*="lobby-nickname"]'
+        ).forEach(el => {
+            const txt = el.textContent.trim();
+            if (txt && !isUiNoise(txt) && !names.includes(txt)) {
+                names.push(txt);
+            }
+        });
+
+        // ---- Panel element ----
+        const panel = document.createElement('div');
+        panel.id = 'kh-players';
+
+        const saved = getPlayersPos();
+        const useTransform = !saved;
+        panel.style.cssText = `
+            position: fixed;
+            left: ${saved ? saved.x + 'px' : '50%'};
+            top: ${saved ? saved.y + 'px' : '50%'};
+            ${useTransform ? 'transform: translate(-50%, -50%);' : ''}
+            background: #0a0a0a;
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            color: #ccc;
+            font-family: 'Segoe UI', sans-serif;
+            font-size: 12px;
+            z-index: 999999;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.9);
+            padding: 12px;
+            min-width: 180px;
+            max-width: 360px;
+            max-height: 70vh;
+            overflow-y: auto;
+            opacity: 0;
+            transition: opacity 0.15s ease, transform 0.15s ease;
+        `;
+
+        const totalCount = names.length + (me && !names.includes(me) ? 1 : 0);
+
+        // ---- Header (drag handle) ----
+        const header = document.createElement('div');
+        header.id = 'kh-players-hdr';
+        header.style.cssText = 'font-weight:700; font-size:13px; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid #2a2a2a; cursor: move; user-select: none;';
+        header.textContent = 'Players (' + totalCount + ')';
+        panel.appendChild(header);
+
+        // ---- Me ----
+        if (me) {
+            const row = document.createElement('div');
+            row.style.cssText = 'padding: 4px 0; border-bottom: 1px solid #1a1a1a; color: #00cc66; font-weight: 600;';
+            row.textContent = me + ' (you)';
+            panel.appendChild(row);
+        }
+
+        // ---- Others ----
+        if (names.length > 0) {
+            names.forEach(name => {
+                if (name === me) return;
+                const row = document.createElement('div');
+                row.style.cssText = 'padding: 4px 0; border-bottom: 1px solid #1a1a1a;';
+                row.textContent = name;
+                panel.appendChild(row);
+            });
+        } else if (!me) {
+            const empty = document.createElement('div');
+            empty.style.cssText = 'opacity:0.5; font-style:italic;';
+            empty.textContent = 'No players found in lobby.';
+            panel.appendChild(empty);
+        }
+
+        // ---- Footer hint ----
+        const hint = document.createElement('div');
+        hint.style.cssText = 'font-size:9px; opacity:0.4; margin-top:8px; text-align:center;';
+        hint.textContent = 'press P to close';
+        panel.appendChild(hint);
+
+        document.body.appendChild(panel);
+
+        // ---- Trigger fade-in ----
+        requestAnimationFrame(() => { panel.style.opacity = '1'; });
+
+        // ============================================================
+        // DRAG SYSTEM (isolated, uses AbortController for cleanup)
+        // ============================================================
+        playersDragAbort = new AbortController();
+        const signal = playersDragAbort.signal;
+
+        let dragging = false;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        header.addEventListener('mousedown', e => {
+            e.preventDefault();
+            // If panel is still centered via transform, lock in absolute coords
+            const r = panel.getBoundingClientRect();
+            if (panel.style.transform && panel.style.transform !== 'none') {
+                panel.style.transform = 'none';
+                panel.style.left = r.left + 'px';
+                panel.style.top = r.top + 'px';
+            }
+            dragging = true;
+            offsetX = e.clientX - r.left;
+            offsetY = e.clientY - r.top;
+        }, { signal });
+
+        document.addEventListener('mousemove', e => {
+            if (!dragging) return;
+            const newX = Math.max(0, Math.min(window.innerWidth - panel.offsetWidth, e.clientX - offsetX));
+            const newY = Math.max(0, Math.min(window.innerHeight - panel.offsetHeight, e.clientY - offsetY));
+            panel.style.left = newX + 'px';
+            panel.style.top = newY + 'px';
+        }, { signal });
+
+        document.addEventListener('mouseup', () => {
+            if (!dragging) return;
+            dragging = false;
+            const r = panel.getBoundingClientRect();
+            savePlayersPos(Math.round(r.left), Math.round(r.top));
+        }, { signal });
+    }
+
+    function hidePlayers() {
+        const panel = document.getElementById('kh-players');
+        if (!panel) return;
+        // Fade out
+        panel.style.opacity = '0';
+        // Clean up drag listeners immediately
+        if (playersDragAbort) {
+            playersDragAbort.abort();
+            playersDragAbort = null;
+        }
+        setTimeout(() => {
+            if (panel.parentElement) panel.remove();
+        }, 150);
+    }
+
+    function togglePlayers() {
+        if (document.getElementById('kh-players')) {
+            hidePlayers();
+        } else {
+            showPlayers();
+        }
+    }
+
+    // ---------- UI (Kahack window — UNCHANGED) ----------
     let ui = null;
-    let hidden = false;
 
     function buildUI() {
         const style = document.createElement('style');
@@ -344,22 +552,16 @@
         `;
         document.body.appendChild(ui);
 
-        // Reveal button
         document.getElementById('kh-reveal').onclick = () => {
-            if (!loaded) {
-                showStatus('no quiz loaded');
-                return;
-            }
+            if (!loaded) { showStatus('no quiz loaded'); return; }
             flashAnswers();
         };
 
-        // Fetch
         document.getElementById('kh-fetch').onclick = () => {
             const raw = document.getElementById('kh-quiz').value;
             fetchQuiz(raw);
         };
 
-        // Enter key triggers fetch
         document.getElementById('kh-quiz').addEventListener('keydown', e => {
             if (e.key === 'Enter') {
                 e.preventDefault();
@@ -367,26 +569,23 @@
             }
         });
 
-        // Drag
+        // Kahack window drag — UNCHANGED
         let drag = false, ox, oy;
-        document.getElementById('kh-hdr').onmousedown = e => {
+        document.getElementById('kh-hdr').addEventListener('mousedown', e => {
             drag = true;
             const r = ui.getBoundingClientRect();
             ox = e.clientX - r.left;
             oy = e.clientY - r.top;
-        };
-        document.onmousemove = e => {
+        });
+        document.addEventListener('mousemove', e => {
             if (!drag) return;
             ui.style.left = Math.max(0, Math.min(window.innerWidth - ui.offsetWidth, e.clientX - ox)) + 'px';
             ui.style.top = Math.max(0, Math.min(window.innerHeight - ui.offsetHeight, e.clientY - oy)) + 'px';
-        };
-        document.onmouseup = () => drag = false;
-    }
-
-    function toggleVisibility() {
-        if (!ui) return;
-        hidden = !hidden;
-        ui.classList.toggle('hidden', hidden);
+        });
+        document.addEventListener('mouseup', () => {
+            if (!drag) return;
+            drag = false;
+        });
     }
 
     // ---------- MONITOR ----------
@@ -411,7 +610,7 @@
             const tag = document.activeElement?.tagName;
             if (tag === 'INPUT' || tag === 'TEXTAREA') return;
             e.preventDefault();
-            toggleVisibility();
+            if (ui) ui.classList.toggle('hidden');
             return;
         }
         if (e.key.toLowerCase() === 'r' && !e.ctrlKey && !e.altKey && !e.metaKey) {
@@ -419,6 +618,13 @@
             if (tag === 'INPUT' || tag === 'TEXTAREA') return;
             e.preventDefault();
             if (loaded) flashAnswers();
+            return;
+        }
+        if (e.key.toLowerCase() === 'p' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            const tag = document.activeElement?.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+            e.preventDefault();
+            togglePlayers();
         }
     });
 
@@ -427,14 +633,11 @@
         buildUI();
         monitor();
 
-        // 1. Restore last saved input
         const saved = getLastInput();
         if (saved) {
             document.getElementById('kh-quiz').value = saved;
             setTimeout(() => fetchQuiz(saved, true), 1500);
-        }
-        // 2. Otherwise, try to detect challenge ID from URL
-        else {
+        } else {
             setTimeout(() => {
                 const m = location.href.match(/\/challenge\/([a-zA-Z0-9_-]+)/);
                 if (m) {
@@ -444,7 +647,7 @@
             }, 1000);
         }
 
-        console.log('[KaHack] v23.1 ready');
+        console.log('[KaHack] v23.6.1 ready — P for players');
     }
 
     init();
